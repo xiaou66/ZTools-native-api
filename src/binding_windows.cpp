@@ -22,6 +22,11 @@
 #include <dwmapi.h>    // For DwmGetWindowAttribute
 #pragma comment(lib, "dwmapi.lib")
 
+// DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+
 // GDI+ 需要 min/max
 namespace Gdiplus {
     using std::min;
@@ -1037,6 +1042,47 @@ static BOOL CALLBACK SCEnumWindowsProc(HWND hwnd, LPARAM lParam) {
 
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     if (style == 0) return TRUE;
+
+    // 检查是否为幽灵窗口（cloaked window）
+    // 幽灵窗口虽然 IsWindowVisible 返回 true，但实际上不可见
+    BOOL isCloaked = FALSE;
+    HRESULT hrCloaked = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
+    if (SUCCEEDED(hrCloaked) && isCloaked) {
+        return TRUE; // 跳过幽灵窗口
+    }
+
+    // 获取窗口类名以进行额外过滤
+    const int MAX_CLASS_NAME = 256;
+    WCHAR className[MAX_CLASS_NAME] = {0};
+    int classNameLen = GetClassNameW(hwnd, className, MAX_CLASS_NAME);
+
+    // 过滤某些特殊的系统窗口类
+    if (classNameLen > 0) {
+        // Windows 输入法相关窗口（如 Microsoft Text Input Application）
+        if (wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
+            // 对于 CoreWindow，再次确认是否真的可见（通过检查是否有有效的可视化区域）
+            RECT clientRect;
+            if (!GetClientRect(hwnd, &clientRect)) return TRUE;
+
+            // 如果客户区太小，很可能是输入法等后台窗口
+            int clientW = clientRect.right - clientRect.left;
+            int clientH = clientRect.bottom - clientRect.top;
+            if (clientW < 100 || clientH < 100) return TRUE;
+        }
+
+        // 过滤 ApplicationFrameWindow 的空壳窗口
+        // UWP 应用在未激活时可能留下空的 ApplicationFrameWindow
+        if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
+            // 检查窗口是否被最小化或隐藏
+            if (IsIconic(hwnd)) return TRUE;
+
+            // 检查是否真的有内容（通过检查窗口透明度或其他属性）
+            BYTE opacity = 255;
+            DWORD cloakedReason = 0;
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloakedReason, sizeof(cloakedReason));
+            if (cloakedReason != 0) return TRUE;
+        }
+    }
 
     int titleLen = GetWindowTextLengthW(hwnd);
     if (titleLen == 0) return TRUE;
