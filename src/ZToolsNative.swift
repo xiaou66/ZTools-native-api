@@ -1106,23 +1106,26 @@ private func colorPickerEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEven
 
     case .leftMouseDown:
         // 左键点击 → 确认取色
+        isColorPickerActive = false // 立即标记，防止后续 mouseMoved 继续更新
         let (_, hex) = capturePixelsAroundCursor()
         let jsonString = "{\"success\":true,\"hex\":\"\(hex)\"}"
         jsonString.withCString { cStr in
             colorPickerCallback?(cStr)
         }
-        stopColorPickerInternal()
+        // 只停事件 tap，不碰窗口（窗口清理由主线程的 stopColorPicker 负责）
+        stopColorPickerEventTap()
         return nil // 拦截点击事件
 
     case .keyDown:
         // ESC 键 → 取消
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         if keyCode == 53 { // ESC
+            isColorPickerActive = false
             let jsonString = "{\"success\":false,\"hex\":null}"
             jsonString.withCString { cStr in
                 colorPickerCallback?(cStr)
             }
-            stopColorPickerInternal()
+            stopColorPickerEventTap()
             return nil // 拦截 ESC
         }
         return Unmanaged.passUnretained(event)
@@ -1252,18 +1255,26 @@ public func startColorPicker(_ callback: ColorPickerCallback?) {
     print("Color picker started")
 }
 
-/// 停止取色器
+/// 停止取色器（从 N-API 主线程调用，负责窗口清理）
 @_cdecl("stopColorPicker")
 public func stopColorPicker() {
-    stopColorPickerInternal()
+    // 停止事件监听（如果还没停的话）
+    if isColorPickerActive {
+        isColorPickerActive = false
+        stopColorPickerEventTap()
+    }
+
+    // 窗口清理（在主线程执行，安全）
+    colorPickerWindow?.orderOut(nil)
+    colorPickerWindow = nil
+    colorPickerView = nil
+    colorPickerCallback = nil
+
+    print("Color picker stopped")
 }
 
-/// 内部停止（可从事件 tap 回调线程或主线程调用）
-private func stopColorPickerInternal() {
-    guard isColorPickerActive else { return }
-    isColorPickerActive = false
-
-    // 停止 CGEventTap
+/// 只停止事件监听（可从任何线程安全调用，不操作 NSWindow）
+private func stopColorPickerEventTap() {
     if let tap = colorPickerEventTap {
         CGEvent.tapEnable(tap: tap, enable: false)
     }
@@ -1276,7 +1287,6 @@ private func stopColorPickerInternal() {
         CFMachPortInvalidate(tap)
     }
 
-    // 停止 RunLoop
     if let runLoop = colorPickerRunLoop {
         CFRunLoopStop(runLoop)
     }
@@ -1284,15 +1294,6 @@ private func stopColorPickerInternal() {
     colorPickerRunLoopSource = nil
     colorPickerEventTap = nil
     colorPickerRunLoop = nil
-
-    // 关闭窗口（需要在主线程操作）
-    // 直接操作也 OK，因为 orderOut 不像 init 那样严格检查线程
-    colorPickerWindow?.orderOut(nil)
-    colorPickerWindow = nil
-    colorPickerView = nil
-    colorPickerCallback = nil
-
-    print("Color picker stopped")
 }
 
 // MARK: - Helper Functions
