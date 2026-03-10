@@ -86,6 +86,7 @@ static HBITMAP g_colorPickerBitmap = NULL;
 static std::string g_colorPickerResult;
 static HHOOK g_colorPickerMouseHook = NULL;
 static HHOOK g_colorPickerKeyboardHook = NULL;
+static std::atomic<bool> g_colorPickerCallbackCalled(false);
 
 // 窗口过程（处理剪贴板消息）
 LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -3698,18 +3699,22 @@ static char g_currentHexColor[8] = "#000000";
 
 // 取色器鼠标钩子
 LRESULT CALLBACK ColorPickerMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_isColorPickerActive) {
+    if (nCode >= 0 && g_isColorPickerActive && !g_colorPickerCallbackCalled) {
         if (wParam == WM_LBUTTONDOWN) {
             // 左键点击 - 确认取色
             if (g_colorPickerTsfn != nullptr) {
-                ColorPickerResult* result = new ColorPickerResult();
-                result->success = true;
-                result->hex = g_currentHexColor;
-                napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
+                // 使用 CAS 确保只调用一次
+                bool expected = false;
+                if (g_colorPickerCallbackCalled.compare_exchange_strong(expected, true)) {
+                    ColorPickerResult* result = new ColorPickerResult();
+                    result->success = true;
+                    result->hex = g_currentHexColor;
+                    napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
 
-                g_isColorPickerActive = false;
-                if (g_colorPickerWindow != NULL) {
-                    PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                    g_isColorPickerActive = false;
+                    if (g_colorPickerWindow != NULL) {
+                        PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                    }
                 }
             }
             return 1; // 拦截事件
@@ -3720,20 +3725,24 @@ LRESULT CALLBACK ColorPickerMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 // 取色器键盘钩子
 LRESULT CALLBACK ColorPickerKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_isColorPickerActive) {
+    if (nCode >= 0 && g_isColorPickerActive && !g_colorPickerCallbackCalled) {
         if (wParam == WM_KEYDOWN) {
             KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
             if (pKbd->vkCode == VK_ESCAPE) {
                 // ESC 键 - 取消
                 if (g_colorPickerTsfn != nullptr) {
-                    ColorPickerResult* result = new ColorPickerResult();
-                    result->success = false;
-                    result->hex = "";
-                    napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
+                    // 使用 CAS 确保只调用一次
+                    bool expected = false;
+                    if (g_colorPickerCallbackCalled.compare_exchange_strong(expected, true)) {
+                        ColorPickerResult* result = new ColorPickerResult();
+                        result->success = false;
+                        result->hex = "";
+                        napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
 
-                    g_isColorPickerActive = false;
-                    if (g_colorPickerWindow != NULL) {
-                        PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                        g_isColorPickerActive = false;
+                        if (g_colorPickerWindow != NULL) {
+                            PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                        }
                     }
                 }
                 return 1; // 拦截事件
@@ -4027,6 +4036,12 @@ void ColorPickerThreadFunc() {
     UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
     g_colorPickerWindow = NULL;
     g_isColorPickerActive = false;
+
+    // 释放 TSFN（在线程结束时释放）
+    if (g_colorPickerTsfn != nullptr) {
+        napi_release_threadsafe_function(g_colorPickerTsfn, napi_tsfn_release);
+        g_colorPickerTsfn = nullptr;
+    }
 }
 
 // 启动取色器
@@ -4042,6 +4057,14 @@ Napi::Value StartColorPicker(const Napi::CallbackInfo& info) {
         Napi::Error::New(env, "Color picker already active").ThrowAsJavaScriptException();
         return env.Undefined();
     }
+
+    // 确保旧线程已经结束
+    if (g_colorPickerThread.joinable()) {
+        g_colorPickerThread.join();
+    }
+
+    // 重置状态
+    g_colorPickerCallbackCalled = false;
 
     // 创建线程安全函数
     napi_value callback = info[0];
@@ -4088,10 +4111,8 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo& info) {
         g_colorPickerThread.join();
     }
 
-    if (g_colorPickerTsfn != nullptr) {
-        napi_release_threadsafe_function(g_colorPickerTsfn, napi_tsfn_release);
-        g_colorPickerTsfn = nullptr;
-    }
+    // 注意：不在这里释放 TSFN，因为可能已经在钩子回调中被使用
+    // TSFN 会在线程清理时被释放
 
     return env.Undefined();
 }

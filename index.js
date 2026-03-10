@@ -360,9 +360,7 @@ class ColorPicker {
     ColorPicker._isActive = true;
 
     addon.startColorPicker((result) => {
-      // 清理 TSFN
-      addon.stopColorPicker();
-
+      // 资源会在 C++ 线程结束时自动清理，不需要手动调用 stopColorPicker
       ColorPicker._isActive = false;
       if (ColorPicker._callback) {
         const cb = ColorPicker._callback;
