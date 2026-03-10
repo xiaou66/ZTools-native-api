@@ -76,6 +76,17 @@ static std::atomic<bool> g_mouseLongPressTriggered(false);
 static bool g_mouseNeedReplay = false;
 #define MOUSE_REPLAY_MAGIC 0x5A544F4F
 
+// 全局变量 - 取色器
+static HWND g_colorPickerWindow = NULL;
+static std::atomic<bool> g_isColorPickerActive(false);
+static napi_threadsafe_function g_colorPickerTsfn = nullptr;
+static std::thread g_colorPickerThread;
+static HDC g_colorPickerMemDC = NULL;
+static HBITMAP g_colorPickerBitmap = NULL;
+static std::string g_colorPickerResult;
+static HHOOK g_colorPickerMouseHook = NULL;
+static HHOOK g_colorPickerKeyboardHook = NULL;
+
 // 窗口过程（处理剪贴板消息）
 LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -3625,6 +3636,466 @@ Napi::Value ResolveMuiStrings(const Napi::CallbackInfo& info) {
     return result;
 }
 
+// ============ 取色器实现 ============
+
+// 取色器结果结构
+struct ColorPickerResult {
+    bool success;
+    std::string hex;
+};
+
+// 取色器回调（在主线程调用 JS）
+void CallColorPickerJs(napi_env env, napi_value js_callback, void* context, void* data) {
+    if (env != nullptr && js_callback != nullptr && data != nullptr) {
+        ColorPickerResult* result = static_cast<ColorPickerResult*>(data);
+
+        Napi::Env napiEnv(env);
+        Napi::Object obj = Napi::Object::New(napiEnv);
+        obj.Set("success", Napi::Boolean::New(napiEnv, result->success));
+
+        if (result->success) {
+            obj.Set("hex", Napi::String::New(napiEnv, result->hex));
+        } else {
+            obj.Set("hex", napiEnv.Null());
+        }
+
+        napi_value argv[1] = { obj };
+        napi_value global;
+        napi_get_global(env, &global);
+        napi_call_function(env, global, js_callback, 1, argv, nullptr);
+
+        delete result;
+    }
+}
+
+// 获取屏幕上指定位置的像素颜色
+COLORREF GetPixelColorAt(HDC memDC, int x, int y) {
+    return GetPixel(memDC, x, y);
+}
+
+// 捕获鼠标周围 9x9 像素的颜色
+void CapturePixelsAroundCursor(HDC memDC, int mouseX, int mouseY, COLORREF colors[9][9], COLORREF& centerColor) {
+    const int gridSize = 9;
+    const int halfGrid = gridSize / 2;
+
+    for (int row = 0; row < gridSize; row++) {
+        for (int col = 0; col < gridSize; col++) {
+            int px = mouseX - halfGrid + col;
+            int py = mouseY - halfGrid + row;
+            colors[row][col] = GetPixelColorAt(memDC, px, py);
+
+            if (row == halfGrid && col == halfGrid) {
+                centerColor = colors[row][col];
+            }
+        }
+    }
+}
+
+// 全局变量存储当前颜色（用于钩子访问）
+static COLORREF g_currentPixelColors[9][9];
+static COLORREF g_currentCenterColor = RGB(0, 0, 0);
+static char g_currentHexColor[8] = "#000000";
+
+// 取色器鼠标钩子
+LRESULT CALLBACK ColorPickerMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && g_isColorPickerActive) {
+        if (wParam == WM_LBUTTONDOWN) {
+            // 左键点击 - 确认取色
+            if (g_colorPickerTsfn != nullptr) {
+                ColorPickerResult* result = new ColorPickerResult();
+                result->success = true;
+                result->hex = g_currentHexColor;
+                napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
+
+                g_isColorPickerActive = false;
+                if (g_colorPickerWindow != NULL) {
+                    PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                }
+            }
+            return 1; // 拦截事件
+        }
+    }
+    return CallNextHookEx(g_colorPickerMouseHook, nCode, wParam, lParam);
+}
+
+// 取色器键盘钩子
+LRESULT CALLBACK ColorPickerKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && g_isColorPickerActive) {
+        if (wParam == WM_KEYDOWN) {
+            KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
+            if (pKbd->vkCode == VK_ESCAPE) {
+                // ESC 键 - 取消
+                if (g_colorPickerTsfn != nullptr) {
+                    ColorPickerResult* result = new ColorPickerResult();
+                    result->success = false;
+                    result->hex = "";
+                    napi_call_threadsafe_function(g_colorPickerTsfn, result, napi_tsfn_nonblocking);
+
+                    g_isColorPickerActive = false;
+                    if (g_colorPickerWindow != NULL) {
+                        PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+                    }
+                }
+                return 1; // 拦截事件
+            }
+        }
+    }
+    return CallNextHookEx(g_colorPickerKeyboardHook, nCode, wParam, lParam);
+}
+
+// 取色器窗口过程
+LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            // 设置定时器，30 FPS 更新
+            SetTimer(hwnd, 1, 33, NULL);
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wParam == 1 && g_isColorPickerActive) {
+                // 获取鼠标位置
+                POINT pt;
+                GetCursorPos(&pt);
+
+                // 捕获像素
+                CapturePixelsAroundCursor(g_colorPickerMemDC, pt.x, pt.y, g_currentPixelColors, g_currentCenterColor);
+
+                // 转换为 HEX
+                sprintf_s(g_currentHexColor, "#%02X%02X%02X",
+                    GetRValue(g_currentCenterColor),
+                    GetGValue(g_currentCenterColor),
+                    GetBValue(g_currentCenterColor));
+
+                // 更新窗口位置（跟随鼠标）
+                const int offsetX = 20;
+                const int offsetY = 20;
+                const int windowWidth = 144;  // 9 * 16
+                const int windowHeight = 172; // 144 + 28
+
+                int newX = pt.x + offsetX;
+                int newY = pt.y + offsetY;
+
+                // 屏幕边界检测
+                int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+                int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+                if (newX + windowWidth > screenWidth) {
+                    newX = pt.x - offsetX - windowWidth;
+                }
+                if (newY + windowHeight > screenHeight) {
+                    newY = pt.y - offsetY - windowHeight;
+                }
+                if (newX < 0) newX = 0;
+                if (newY < 0) newY = 0;
+
+                SetWindowPos(hwnd, HWND_TOPMOST, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+
+                // 重绘窗口
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+
+            // 使用双缓冲绘制
+            HDC memDC = CreateCompatibleDC(hdc);
+            RECT clientRect;
+            GetClientRect(hwnd, &clientRect);
+            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect.right, clientRect.bottom);
+            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+            const int gridSize = 9;
+            const int cellSize = 16;
+            const int totalGridWidth = gridSize * cellSize;
+            const int labelHeight = 28;
+
+            // 绘制背景
+            HBRUSH bgBrush = CreateSolidBrush(RGB(217, 217, 217));
+            FillRect(memDC, &clientRect, bgBrush);
+            DeleteObject(bgBrush);
+
+            // 绘制 9x9 像素网格
+            for (int row = 0; row < gridSize; row++) {
+                for (int col = 0; col < gridSize; col++) {
+                    RECT cellRect = {
+                        col * cellSize,
+                        row * cellSize,
+                        (col + 1) * cellSize,
+                        (row + 1) * cellSize
+                    };
+
+                    // 填充颜色
+                    HBRUSH brush = CreateSolidBrush(g_currentPixelColors[row][col]);
+                    FillRect(memDC, &cellRect, brush);
+                    DeleteObject(brush);
+
+                    // 绘制网格线
+                    HPEN pen = CreatePen(PS_SOLID, 1, RGB(191, 191, 191));
+                    HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+                    MoveToEx(memDC, cellRect.left, cellRect.top, NULL);
+                    LineTo(memDC, cellRect.right, cellRect.top);
+                    LineTo(memDC, cellRect.right, cellRect.bottom);
+                    LineTo(memDC, cellRect.left, cellRect.bottom);
+                    LineTo(memDC, cellRect.left, cellRect.top);
+                    SelectObject(memDC, oldPen);
+                    DeleteObject(pen);
+                }
+            }
+
+            // 绘制中心十字准星
+            RECT centerRect = {
+                4 * cellSize,
+                4 * cellSize,
+                5 * cellSize,
+                5 * cellSize
+            };
+
+            // 外层黑框
+            HPEN blackPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+            HPEN oldPen = (HPEN)SelectObject(memDC, blackPen);
+            SelectObject(memDC, GetStockObject(NULL_BRUSH));
+            Rectangle(memDC, centerRect.left - 1, centerRect.top - 1, centerRect.right + 1, centerRect.bottom + 1);
+            SelectObject(memDC, oldPen);
+            DeleteObject(blackPen);
+
+            // 内层白框
+            HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+            oldPen = (HPEN)SelectObject(memDC, whitePen);
+            Rectangle(memDC, centerRect.left, centerRect.top, centerRect.right, centerRect.bottom);
+            SelectObject(memDC, oldPen);
+            DeleteObject(whitePen);
+
+            // 绘制 HEX 标签区域
+            RECT labelRect = { 0, totalGridWidth, totalGridWidth, totalGridWidth + labelHeight };
+            HBRUSH labelBrush = CreateSolidBrush(RGB(38, 38, 38));
+            FillRect(memDC, &labelRect, labelBrush);
+            DeleteObject(labelBrush);
+
+            // 绘制 HEX 文本
+            SetBkMode(memDC, TRANSPARENT);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            HFONT font = CreateFontW(13, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+            HFONT oldFont = (HFONT)SelectObject(memDC, font);
+
+            RECT textRect = { 0, totalGridWidth + 5, totalGridWidth, totalGridWidth + labelHeight };
+            DrawTextA(memDC, g_currentHexColor, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(memDC, oldFont);
+            DeleteObject(font);
+
+            // 复制到屏幕
+            BitBlt(hdc, 0, 0, clientRect.right, clientRect.bottom, memDC, 0, 0, SRCCOPY);
+
+            SelectObject(memDC, oldBitmap);
+            DeleteObject(memBitmap);
+            DeleteDC(memDC);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            KillTimer(hwnd, 1);
+            PostQuitMessage(0);
+            return 0;
+        }
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// 取色器线程函数
+void ColorPickerThreadFunc() {
+    // 捕获整个屏幕到内存 DC
+    HDC screenDC = GetDC(NULL);
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    g_colorPickerMemDC = CreateCompatibleDC(screenDC);
+    g_colorPickerBitmap = CreateCompatibleBitmap(screenDC, screenWidth, screenHeight);
+    SelectObject(g_colorPickerMemDC, g_colorPickerBitmap);
+    BitBlt(g_colorPickerMemDC, 0, 0, screenWidth, screenHeight, screenDC, 0, 0, SRCCOPY);
+    ReleaseDC(NULL, screenDC);
+
+    // 注册窗口类
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc = ColorPickerWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_CROSS);
+    wc.lpszClassName = L"ZToolsColorPicker";
+
+    if (!RegisterClassExW(&wc)) {
+        DeleteDC(g_colorPickerMemDC);
+        DeleteObject(g_colorPickerBitmap);
+        g_colorPickerMemDC = NULL;
+        g_colorPickerBitmap = NULL;
+        g_isColorPickerActive = false;
+        return;
+    }
+
+    // 创建窗口
+    const int windowWidth = 144;  // 9 * 16
+    const int windowHeight = 172; // 144 + 28
+
+    POINT pt;
+    GetCursorPos(&pt);
+
+    g_colorPickerWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        L"ZToolsColorPicker",
+        L"Color Picker",
+        WS_POPUP,
+        pt.x + 20, pt.y + 20, windowWidth, windowHeight,
+        NULL, NULL, GetModuleHandle(NULL), NULL
+    );
+
+    if (g_colorPickerWindow == NULL) {
+        UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
+        DeleteDC(g_colorPickerMemDC);
+        DeleteObject(g_colorPickerBitmap);
+        g_colorPickerMemDC = NULL;
+        g_colorPickerBitmap = NULL;
+        g_isColorPickerActive = false;
+        return;
+    }
+
+    // 设置窗口透明度和圆角
+    SetLayeredWindowAttributes(g_colorPickerWindow, 0, 255, LWA_ALPHA);
+
+    // 显示窗口
+    ShowWindow(g_colorPickerWindow, SW_SHOW);
+    SetForegroundWindow(g_colorPickerWindow);
+
+    // 安装全局钩子
+    g_colorPickerMouseHook = SetWindowsHookExW(WH_MOUSE_LL, ColorPickerMouseProc, GetModuleHandle(NULL), 0);
+    g_colorPickerKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, ColorPickerKeyboardProc, GetModuleHandle(NULL), 0);
+
+    if (g_colorPickerMouseHook == NULL || g_colorPickerKeyboardHook == NULL) {
+        // 钩子安装失败，清理并退出
+        if (g_colorPickerMouseHook) {
+            UnhookWindowsHookEx(g_colorPickerMouseHook);
+            g_colorPickerMouseHook = NULL;
+        }
+        if (g_colorPickerKeyboardHook) {
+            UnhookWindowsHookEx(g_colorPickerKeyboardHook);
+            g_colorPickerKeyboardHook = NULL;
+        }
+        DestroyWindow(g_colorPickerWindow);
+        UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
+        DeleteDC(g_colorPickerMemDC);
+        DeleteObject(g_colorPickerBitmap);
+        g_colorPickerMemDC = NULL;
+        g_colorPickerBitmap = NULL;
+        g_colorPickerWindow = NULL;
+        g_isColorPickerActive = false;
+        return;
+    }
+
+    // 消息循环
+    MSG msg;
+    while (g_isColorPickerActive && GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    // 卸载钩子
+    if (g_colorPickerMouseHook) {
+        UnhookWindowsHookEx(g_colorPickerMouseHook);
+        g_colorPickerMouseHook = NULL;
+    }
+    if (g_colorPickerKeyboardHook) {
+        UnhookWindowsHookEx(g_colorPickerKeyboardHook);
+        g_colorPickerKeyboardHook = NULL;
+    }
+
+    // 清理
+    if (g_colorPickerMemDC) {
+        DeleteDC(g_colorPickerMemDC);
+        g_colorPickerMemDC = NULL;
+    }
+    if (g_colorPickerBitmap) {
+        DeleteObject(g_colorPickerBitmap);
+        g_colorPickerBitmap = NULL;
+    }
+    UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
+    g_colorPickerWindow = NULL;
+    g_isColorPickerActive = false;
+}
+
+// 启动取色器
+Napi::Value StartColorPicker(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected a callback function").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (g_isColorPickerActive) {
+        Napi::Error::New(env, "Color picker already active").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // 创建线程安全函数
+    napi_value callback = info[0];
+    napi_value resource_name;
+    napi_create_string_utf8(env, "ColorPickerCallback", NAPI_AUTO_LENGTH, &resource_name);
+
+    napi_create_threadsafe_function(
+        env,
+        callback,
+        nullptr,
+        resource_name,
+        0,
+        1,
+        nullptr,
+        nullptr,
+        nullptr,
+        CallColorPickerJs,
+        &g_colorPickerTsfn
+    );
+
+    g_isColorPickerActive = true;
+
+    // 启动取色器线程
+    g_colorPickerThread = std::thread(ColorPickerThreadFunc);
+
+    return env.Undefined();
+}
+
+// 停止取色器
+Napi::Value StopColorPicker(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (!g_isColorPickerActive) {
+        return env.Undefined();
+    }
+
+    g_isColorPickerActive = false;
+
+    if (g_colorPickerWindow != NULL) {
+        PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
+    }
+
+    if (g_colorPickerThread.joinable()) {
+        g_colorPickerThread.join();
+    }
+
+    if (g_colorPickerTsfn != nullptr) {
+        napi_release_threadsafe_function(g_colorPickerTsfn, napi_tsfn_release);
+        g_colorPickerTsfn = nullptr;
+    }
+
+    return env.Undefined();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -3640,6 +4111,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
     exports.Set("startMouseMonitor", Napi::Function::New(env, StartMouseMonitor));
     exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
+    exports.Set("startColorPicker", Napi::Function::New(env, StartColorPicker));
+    exports.Set("stopColorPicker", Napi::Function::New(env, StopColorPicker));
     exports.Set("getUwpApps", Napi::Function::New(env, GetUwpApps));
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));

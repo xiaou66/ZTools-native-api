@@ -348,10 +348,6 @@ class ColorPicker {
    * });
    */
   static start(callback) {
-    if (platform !== 'darwin') {
-      throw new Error('ColorPicker is only supported on macOS');
-    }
-
     if (ColorPicker._isActive) {
       throw new Error('Color picker is already active');
     }
