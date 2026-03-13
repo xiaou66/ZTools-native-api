@@ -20,6 +20,10 @@ typedef void (*MouseEventCB)(const char *);                       // 鼠标事�
 typedef void (*StartMouseMonitorFunc)(const char *, int, MouseEventCB); // 启动鼠标监控
 typedef void (*StopMouseMonitorFunc)();                            // 停止鼠标监控
 typedef void (*ReplayMouseEventsFunc)();                           // 重放鼠标事件
+typedef int (*SimulateMouseMoveFunc)(double, double);              // 模拟鼠标移动
+typedef int (*SimulateMouseClickFunc)(double, double);             // 模拟鼠标单击
+typedef int (*SimulateMouseDoubleClickFunc)(double, double);       // 模拟鼠标双击
+typedef int (*SimulateMouseRightClickFunc)(double, double);        // 模拟鼠标右击
 typedef void (*ColorPickerCB)(const char *);                       // 取色器回调
 typedef void (*StartColorPickerFunc)(ColorPickerCB);               // 启动取色器
 typedef void (*StopColorPickerFunc)();                             // 停止取色器
@@ -41,6 +45,10 @@ static napi_threadsafe_function mouseTsfn = nullptr;
 static StartMouseMonitorFunc startMouseMonitorFunc = nullptr;
 static StopMouseMonitorFunc stopMouseMonitorFunc = nullptr;
 static ReplayMouseEventsFunc replayMouseEventsFunc = nullptr;
+static SimulateMouseMoveFunc simulateMouseMoveFunc = nullptr;
+static SimulateMouseClickFunc simulateMouseClickFunc = nullptr;
+static SimulateMouseDoubleClickFunc simulateMouseDoubleClickFunc = nullptr;
+static SimulateMouseRightClickFunc simulateMouseRightClickFunc = nullptr;
 static napi_threadsafe_function colorPickerTsfn = nullptr;
 static StartColorPickerFunc startColorPickerFunc = nullptr;
 static StopColorPickerFunc stopColorPickerFunc = nullptr;
@@ -261,6 +269,14 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StopMouseMonitorFunc)dlsym(swiftLibHandle, "stopMouseMonitor");
   replayMouseEventsFunc =
       (ReplayMouseEventsFunc)dlsym(swiftLibHandle, "replayMouseEvents");
+  simulateMouseMoveFunc =
+      (SimulateMouseMoveFunc)dlsym(swiftLibHandle, "simulateMouseMove");
+  simulateMouseClickFunc =
+      (SimulateMouseClickFunc)dlsym(swiftLibHandle, "simulateMouseClick");
+  simulateMouseDoubleClickFunc =
+      (SimulateMouseDoubleClickFunc)dlsym(swiftLibHandle, "simulateMouseDoubleClick");
+  simulateMouseRightClickFunc =
+      (SimulateMouseRightClickFunc)dlsym(swiftLibHandle, "simulateMouseRightClick");
   startColorPickerFunc =
       (StartColorPickerFunc)dlsym(swiftLibHandle, "startColorPicker");
   stopColorPickerFunc =
@@ -269,6 +285,8 @@ bool LoadSwiftLibrary(Napi::Env env) {
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
       !simulatePasteFunc || !simulateKeyboardTapFunc ||
+      !simulateMouseMoveFunc || !simulateMouseClickFunc ||
+      !simulateMouseDoubleClickFunc || !simulateMouseRightClickFunc ||
       !startMouseMonitorFunc || !stopMouseMonitorFunc ||
       !startColorPickerFunc || !stopColorPickerFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
@@ -594,6 +612,86 @@ napi_value OnMousePromiseResolved(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
+// 模拟鼠标移动
+Napi::Value SimulateMouseMove(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected x and y as number arguments")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  double x = info[0].As<Napi::Number>().DoubleValue();
+  double y = info[1].As<Napi::Number>().DoubleValue();
+  int success = simulateMouseMoveFunc(x, y);
+  return Napi::Boolean::New(env, success == 1);
+}
+
+// 模拟鼠标左键单击
+Napi::Value SimulateMouseClick(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected x and y as number arguments")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  double x = info[0].As<Napi::Number>().DoubleValue();
+  double y = info[1].As<Napi::Number>().DoubleValue();
+  int success = simulateMouseClickFunc(x, y);
+  return Napi::Boolean::New(env, success == 1);
+}
+
+// 模拟鼠标左键双击
+Napi::Value SimulateMouseDoubleClick(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected x and y as number arguments")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  double x = info[0].As<Napi::Number>().DoubleValue();
+  double y = info[1].As<Napi::Number>().DoubleValue();
+  int success = simulateMouseDoubleClickFunc(x, y);
+  return Napi::Boolean::New(env, success == 1);
+}
+
+// 模拟鼠标右键单击
+Napi::Value SimulateMouseRightClick(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected x and y as number arguments")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  double x = info[0].As<Napi::Number>().DoubleValue();
+  double y = info[1].As<Napi::Number>().DoubleValue();
+  int success = simulateMouseRightClickFunc(x, y);
+  return Napi::Boolean::New(env, success == 1);
+}
+
 // 在主线程调用 JS 回调（鼠标事件）
 void CallMouseJs(napi_env env, napi_value js_callback, void *context,
                  void *data) {
@@ -825,6 +923,14 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
   exports.Set("simulateKeyboardTap",
               Napi::Function::New(env, SimulateKeyboardTap));
+  exports.Set("simulateMouseMove",
+              Napi::Function::New(env, SimulateMouseMove));
+  exports.Set("simulateMouseClick",
+              Napi::Function::New(env, SimulateMouseClick));
+  exports.Set("simulateMouseDoubleClick",
+              Napi::Function::New(env, SimulateMouseDoubleClick));
+  exports.Set("simulateMouseRightClick",
+              Napi::Function::New(env, SimulateMouseRightClick));
   exports.Set("startMouseMonitor",
               Napi::Function::New(env, StartMouseMonitor));
   exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
