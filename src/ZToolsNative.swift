@@ -494,6 +494,59 @@ public func simulateKeyboardTap(_ key: UnsafePointer<CChar>?, _ modifiers: Unsaf
     return 1
 }
 
+// MARK: - Clipboard Files
+
+/// 设置剪贴板中的文件列表（文件路径以换行符分隔的 C 字符串）
+/// - Parameter pathsCStr: 以换行符分隔的文件路径列表
+/// - Returns: 1 成功，0 失败
+@_cdecl("setClipboardFiles")
+public func setClipboardFiles(_ pathsCStr: UnsafePointer<CChar>?) -> Int32 {
+    guard let pathsCStr = pathsCStr else { return 0 }
+    let pathsString = String(cString: pathsCStr)
+    let paths = pathsString.split(separator: "\n").map(String.init)
+    guard !paths.isEmpty else { return 0 }
+
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+
+    var urls: [URL] = []
+    for p in paths {
+        let url = URL(fileURLWithPath: p)
+        // 验证文件存在
+        if FileManager.default.fileExists(atPath: p) {
+            urls.append(url)
+        }
+    }
+
+    guard !urls.isEmpty else { return 0 }
+
+    let success = pasteboard.writeObjects(urls as [NSPasteboardWriting])
+    return success ? 1 : 0
+}
+
+// MARK: - Unicode Type
+
+@_cdecl("unicodeType")
+public func unicodeType(_ text: UnsafePointer<CChar>?) -> Int32 {
+    guard let text = text else { return 0 }
+    let str = String(cString: text)
+    guard !str.isEmpty else { return 0 }
+
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else { return 0 }
+
+    let chars = Array(str.utf16)
+    guard let downEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true) else { return 0 }
+    downEvent.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
+    downEvent.post(tap: .cghidEventTap)
+
+    usleep(10_000) // 10ms 延迟
+
+    guard let upEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false) else { return 0 }
+    upEvent.post(tap: .cghidEventTap)
+
+    return 1
+}
+
 // MARK: - Mouse Monitor
 
 public typealias MouseCallback = @convention(c) (UnsafePointer<CChar>?) -> Void

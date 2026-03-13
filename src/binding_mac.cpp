@@ -16,6 +16,8 @@ typedef int (*ActivateWindowFunc)(const char *);
 typedef int (*SimulatePasteFunc)(); // 模拟粘贴功能
 typedef int (*SimulateKeyboardTapFunc)(const char *,
                                        const char *); // 模拟键盘按键功能
+typedef int (*UnicodeTypeFunc)(const char *);              // Unicode 字符输入
+typedef int (*SetClipboardFilesFunc)(const char *);        // 设置剪贴板文件
 typedef void (*MouseEventCB)(const char *);                       // 鼠标事件回调
 typedef void (*StartMouseMonitorFunc)(const char *, int, MouseEventCB); // 启动鼠标监控
 typedef void (*StopMouseMonitorFunc)();                            // 停止鼠标监控
@@ -40,6 +42,8 @@ static ActivateWindowFunc activateWindowFunc = nullptr;
 static SimulatePasteFunc simulatePasteFunc = nullptr; // 模拟粘贴函数
 static SimulateKeyboardTapFunc simulateKeyboardTapFunc =
     nullptr; // 模拟键盘按键函数
+static UnicodeTypeFunc unicodeTypeFunc = nullptr; // Unicode 字符输入函数
+static SetClipboardFilesFunc setClipboardFilesFunc = nullptr; // 设置剪贴板文件函数
 static napi_threadsafe_function mouseTsfn = nullptr;
 static StartMouseMonitorFunc startMouseMonitorFunc = nullptr;
 static StopMouseMonitorFunc stopMouseMonitorFunc = nullptr;
@@ -261,6 +265,10 @@ bool LoadSwiftLibrary(Napi::Env env) {
   simulatePasteFunc = (SimulatePasteFunc)dlsym(swiftLibHandle, "simulatePaste");
   simulateKeyboardTapFunc =
       (SimulateKeyboardTapFunc)dlsym(swiftLibHandle, "simulateKeyboardTap");
+  unicodeTypeFunc =
+      (UnicodeTypeFunc)dlsym(swiftLibHandle, "unicodeType");
+  setClipboardFilesFunc =
+      (SetClipboardFilesFunc)dlsym(swiftLibHandle, "setClipboardFiles");
   startMouseMonitorFunc =
       (StartMouseMonitorFunc)dlsym(swiftLibHandle, "startMouseMonitor");
   stopMouseMonitorFunc =
@@ -280,11 +288,12 @@ bool LoadSwiftLibrary(Napi::Env env) {
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
-      !simulatePasteFunc || !simulateKeyboardTapFunc ||
+      !simulatePasteFunc || !simulateKeyboardTapFunc || !unicodeTypeFunc ||
       !simulateMouseMoveFunc || !simulateMouseClickFunc ||
       !simulateMouseDoubleClickFunc || !simulateMouseRightClickFunc ||
       !startMouseMonitorFunc || !stopMouseMonitorFunc ||
-      !startColorPickerFunc || !stopColorPickerFunc) {
+      !startColorPickerFunc || !stopColorPickerFunc ||
+      !setClipboardFilesFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -827,6 +836,71 @@ Napi::Value StartColorPicker(const Napi::CallbackInfo &info) {
   return env.Undefined();
 }
 
+// 设置剪贴板文件列表
+Napi::Value SetClipboardFiles(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 1 || !info[0].IsArray()) {
+    Napi::TypeError::New(env, "Expected array of file paths as first argument")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  Napi::Array arr = info[0].As<Napi::Array>();
+  if (arr.Length() == 0) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  // 将路径数组拼接为换行符分隔的字符串
+  std::string paths;
+  for (uint32_t i = 0; i < arr.Length(); i++) {
+    Napi::Value item = arr.Get(i);
+    std::string p;
+    if (item.IsString()) {
+      p = item.As<Napi::String>().Utf8Value();
+    } else if (item.IsObject()) {
+      Napi::Object obj = item.As<Napi::Object>();
+      if (obj.Has("path") && obj.Get("path").IsString()) {
+        p = obj.Get("path").As<Napi::String>().Utf8Value();
+      }
+    }
+    if (!p.empty()) {
+      if (!paths.empty()) paths += "\n";
+      paths += p;
+    }
+  }
+
+  if (paths.empty()) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  int success = setClipboardFilesFunc(paths.c_str());
+  return Napi::Boolean::New(env, success == 1);
+}
+
+// Unicode 字符输入
+Napi::Value UnicodeType(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected text as first argument (string)")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  std::string text = info[0].As<Napi::String>().Utf8Value();
+  int success = unicodeTypeFunc(text.c_str());
+  return Napi::Boolean::New(env, success == 1);
+}
+
 // 停止取色器
 Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
@@ -869,6 +943,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startColorPicker",
               Napi::Function::New(env, StartColorPicker));
   exports.Set("stopColorPicker", Napi::Function::New(env, StopColorPicker));
+  exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
+  exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
   return exports;
 }
 

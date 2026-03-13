@@ -4304,6 +4304,44 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// Unicode 字符输入
+Napi::Value UnicodeType(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected text as first argument (string)").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    std::string text = info[0].As<Napi::String>().Utf8Value();
+
+    // UTF-8 转 UTF-16
+    int wideSize = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, NULL, 0);
+    if (wideSize <= 0) {
+        return Napi::Boolean::New(env, false);
+    }
+    std::wstring wtext(wideSize - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wtext[0], wideSize);
+
+    std::vector<INPUT> inputs;
+    for (wchar_t ch : wtext) {
+        INPUT down = {};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wScan = ch;
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs.push_back(down);
+
+        INPUT up = {};
+        up.type = INPUT_KEYBOARD;
+        up.ki.wScan = ch;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(up);
+    }
+
+    UINT result = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    return Napi::Boolean::New(env, result == inputs.size());
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -4329,6 +4367,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
     exports.Set("resolveMuiStrings", Napi::Function::New(env, ResolveMuiStrings));
+    exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
     return exports;
 }
 
